@@ -6,11 +6,12 @@ import asyncio
 import httpx
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
+from ai_helper import ask_ai
+
 
 # 读取环境变量
 load_dotenv()
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 
 # 配置 Discord 机器人
 intents = discord.Intents.default()
@@ -62,65 +63,13 @@ async def get_trump_posts(count=1):
 
         print(f"✅ 实际爬取 {len(posts)} 条帖子")
         return posts
-
-# ✅ 使用 OpenRouter 生成 Trump 风格的笑话
-async def ask_trump_joke(topic=""):
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://yourdomain.com",
-        "X-Title": "Trump Joke Generator"
-    }
-
-    data = {
-        "model": "google/gemini-2.5-pro-exp-03-25:free",  # 或其他支持的模型
-        "messages": [
-            {
-                "role": "system",
-                "content": "You are Donald Trump. Write short, bold, sarcastic, tweet-style jokes or insults. Be funny, exaggerate, and act like you're on Twitter. Use all-caps and emojis if needed."
-            },
-            {
-                "role": "user",
-                "content": f"Make a funny tweet about {topic or 'fake news'}"
-            }
-        ],
-        "temperature": 0.9,
-        "top_p": 0.9,
-        "max_tokens": 256
-    }
-
-    try:
-        async with httpx.AsyncClient() as client:
-            res = await client.post(
-                "https://openrouter.ai/api/v1/chat/completions",
-                headers=headers,
-                json=data
-            )
-
-            raw_text = await res.aread()
-
-            if res.status_code != 200:
-                print("❌ OpenRouter API 错误状态码:", res.status_code)
-                print("🔍 返回内容:", raw_text.decode())
-                return f"⚠️ API 错误 {res.status_code}"
-
-            try:
-                res_data = res.json()
-            except Exception as e:
-                print("❌ JSON 解析失败:", e)
-                print("🔍 原始内容:", raw_text.decode())
-                return "⚠️ 无法解析 OpenRouter 的响应，请稍后再试"
-
-            if "choices" not in res_data or not res_data["choices"]:
-                print("❌ 返回中缺少 'choices'")
-                print("🧾 完整响应:", res_data)
-                return "⚠️ OpenRouter 没有返回有效内容，请稍后再试！"
-
-            return res_data["choices"][0]["message"]["content"].strip()
-
-    except Exception as e:
-        print("❌ OpenRouter 异常:", e)
-        return "⚠️ OpenRouter 请求失败，请稍后再试！"
+    
+def select_valid_post(posts):
+    for post in posts:
+        clean = post.strip().lower()
+        if 20 < len(clean) < 300 and not re.match(r"^(thank|thanks|great|good|👍|🙏)", clean):
+            return post
+    return posts[0] if posts else "Trump posted something big and beautiful, folks!"
 
 # ✅ 机器人上线提示
 @bot.event
@@ -140,8 +89,21 @@ async def trump(ctx, count: int = 1):
 @bot.command()
 async def trumpjoke(ctx, *, topic: str = ""):
     print(f"📩 收到命令: /trumpjoke {topic}")
-    joke = await ask_trump_joke(topic)
+    if topic:
+        joke = await ask_ai(topic=topic)
+    else:
+        posts = await get_trump_posts(5)
+        chosen = select_valid_post(posts)
+        print(f"🧠 使用 Trump 自己的发言:\n{chosen}")
+        joke = await ask_ai(
+            user=f'''Donald Trump just posted on Truth Social:
+
+"{chosen}"
+
+Write a funnier, bolder Trump-style reply to his own post. Be sarcastic, confident, and hilarious. One tweet only.'''
+        )
     await ctx.send(f"🧠 **Trump 风格笑话**:\n{joke}")
+
 
 # ✅ @机器人时处理
 @bot.event
@@ -165,13 +127,22 @@ Commands:
 - @Bot 3: Get 3 latest posts
 - @Bot help: Show this amazing help
 """
-            help_text = await ask_trump_joke(help_prompt)
+            help_text = await ask_ai(user=help_prompt)
             await message.channel.send(f"📢 **TrumpBot Help**:\n{help_text}")
             return
 
 
         if "joke" in content_lower:
-            joke = await ask_trump_joke()
+            posts = await get_trump_posts(5)
+            chosen = select_valid_post(posts)
+            print(f"🤖 @Bot joke 使用 Trump 自己的发言:\n{chosen}")
+            joke = await ask_ai(
+                user=f'''Donald Trump just posted:
+
+"{chosen}"
+
+Now write a savage Trump-style tweet replying to himself. Go hard. One tweet only.'''
+            )
             await message.channel.send(f"🧠 **Trump 风格笑话**:\n{joke}")
             return
 
