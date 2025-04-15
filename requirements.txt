@@ -13,3 +13,4 @@ pyee==12.1.1
 python-dotenv==1.0.1
 typing_extensions==4.12.2
 yarl==1.18.3
+httpx==0.27.0
