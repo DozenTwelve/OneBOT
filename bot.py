@@ -3,10 +3,9 @@ import discord
 from discord.ext import commands
 import re
 import asyncio
-import httpx
 from dotenv import load_dotenv
 from playwright.async_api import async_playwright
-from ai_helper import ask_ai
+from ai_helper import ask_ai, check_memory_and_exit
 
 
 # 读取环境变量
@@ -62,6 +61,7 @@ async def get_trump_posts(count=1):
             return ["❌ 未找到帖子！可能是网站加载过慢，请重试！"]
 
         print(f"✅ 实际爬取 {len(posts)} 条帖子")
+        check_memory_and_exit()  # ✅ 添加这行，爬完即检测
         return posts
     
 def select_valid_post(posts):
