@@ -73,7 +73,7 @@ async def ask_trump_joke(topic=""):
     }
 
     data = {
-        "model": "gpt-4",  # 或其他支持的模型
+        "model": "google/gemini-2.5-pro-exp-03-25:free",  # 或其他支持的模型
         "messages": [
             {
                 "role": "system",
