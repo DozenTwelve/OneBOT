@@ -4,7 +4,7 @@ import re
 import psutil
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-3n-e2b-it:free")
+MODEL = os.getenv("OPENROUTER_MODEL", "deepseek/deepseek-r1-0528-qwen3-8b:free")
 CURRENT_YEAR = "2025"
 
 # ✅ 检测内存，超过限制自动退出
