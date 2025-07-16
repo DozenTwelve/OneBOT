@@ -4,7 +4,7 @@ import re
 import psutil
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = os.getenv("OPENROUTER_MODEL", "google/gemini-2.0-flash-exp:free")
+MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-3n-e2b-it:free")
 CURRENT_YEAR = "2025"
 
 # ✅ 检测内存，超过限制自动退出
