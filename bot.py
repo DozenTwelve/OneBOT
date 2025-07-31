@@ -35,7 +35,7 @@ async def get_trump_posts(count=1):
         await page.wait_for_timeout(5000)
 
         posts = []
-        max_scrolls = 10
+        max_scrolls = 25
         scroll_count = 0
 
         while len(posts) < count and scroll_count < max_scrolls:
@@ -102,7 +102,7 @@ async def trumpjoke(ctx, *, topic: str = ""):
 
 Write a funnier, bolder Trump-style reply to his own post. Be sarcastic, confident, and hilarious. One tweet only.'''
         )
-    await ctx.send(f"🧠 **Trump 风格笑话**:\n{joke}")
+    await ctx.send(f"{joke}")
 
 
 # ✅ @机器人时处理
@@ -143,7 +143,7 @@ Commands:
 
 Now write a savage Trump-style tweet replying to himself. Go hard. One tweet only.'''
             )
-            await message.channel.send(f"🧠 **Trump 风格笑话**:\n{joke}")
+            await message.channel.send(f"🧠**:{joke}")
             return
 
         match = re.search(r'\b([1-5])\b', message.content)

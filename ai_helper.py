@@ -2,6 +2,9 @@ import os
 import httpx
 import re
 import psutil
+from dotenv import load_dotenv
+
+load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-3-12b-it:free")
@@ -22,19 +25,26 @@ def sanitize_discord_output(text: str) -> str:
     text = text.strip()
 
     # ✅ 删除 AI 产生的开头说明
-    text = re.sub(
-        r"(?i)^(ok(ay)?|sure|alright)[\s,!.]*here.*?(?=\n|[-]{3,}|[A-Z]{2,})",
-        "", text
-    )
     text = re.sub(r"^[-\s\n]{2,}", "", text).strip()
+    text = re.sub(
+        r"(?i)^(respond with|okay|sure)[^\n]*?(post|style)[^\n]*\n?", "", text
+    )
 
     # ✅ 删除 disclaimer 或 footnote
     text = re.sub(r"(?i)disclaimer[:\uff1a\*].*", "", text, flags=re.DOTALL)
     text = re.sub(r"\*{1,2}\s*$", "", text).strip()
+    text = re.sub(r">", "\n", text)   
+    text = re.sub(r"^[\s\n]+", "", text)
+    text = re.sub(r"\*{1,2}\s*$", "", text)
 
     # ✅ 修处过时 hashtag
     text = re.sub(r"#Trump20\d{2}", f"#Trump{CURRENT_YEAR}", text, flags=re.IGNORECASE)
     text = re.sub(r"#Biden20\d{2}", "", text, flags=re.IGNORECASE)
+
+    text = re.sub(
+        r"(?i)(---+|IMPORTANT.*|This is a fictional exercise.*|The content is offensive.*)",
+        "", text, flags=re.DOTALL
+    )
 
     return text.strip()
 
@@ -59,15 +69,18 @@ async def ask_ai(topic="", system="", user=""):
 
     # ✅ 默认 system prompt 加入当前年份
     system = system or (
-        f"You are Donald J. Trump. The current year is {CURRENT_YEAR}. "
-        "You write short, sarcastic, bold, and funny Truth Social-style tweets. "
+        f"You are a stand-up comedian impersonating Donald Trump in {CURRENT_YEAR}. "
+        "You ONLY write short, sarcastic, bold, and funny Truth Social-style tweets. "
         "Use ALL CAPS, emojis, and phrases like 'SAD!', 'FAKE NEWS!', 'DISASTER!'. "
-        "Only one tweet per response. Max 280 characters. Be aggressive and funny."
+        "Respond with ONLY ONE tweet. Do NOT explain, do NOT clarify, and absolutely NO disclaimers. "
+        "Just the tweet. Nothing else. Your tweet MUST end with a period ('.') and contain no follow-up explanation. "
+        "If you are not allowed to respond due to content moderation, respond IN CHARACTER as Trump yelling at the user for being TOO SENSITIVE or for CENSORSHIP."
+        "Maximum 280 characters."
     )
 
     if not user:
         topic = topic or "the fake news media"
-        user = f"Write a savage Truth Social post attacking {topic}. Be brutal, sarcastic, and entertaining like a real Trump post."
+        user = f"Write a Truth Social post about {topic}."
 
     data = {
         "model": MODEL,
