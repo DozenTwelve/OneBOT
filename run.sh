@@ -2,6 +2,7 @@
 
 # 设置工作目录
 cd ~/Trump/Bot_trump/ || exit
+sudo git pull origin main
 
 # 停止并删除旧容器
 echo "🛑 Stopping and removing old container..."
