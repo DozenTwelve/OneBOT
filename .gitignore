@@ -1,4 +1,4 @@
 # ignore local environment config
 .env
 *.env
-.env.*
+.env.*README.md
