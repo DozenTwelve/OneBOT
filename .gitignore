@@ -1,0 +1,4 @@
+# ignore local environment config
+.env
+*.env
+.env.*
