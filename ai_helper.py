@@ -1,6 +1,8 @@
+import logging
 import os
-import httpx
 import re
+
+import httpx
 import psutil
 from dotenv import load_dotenv
 
@@ -9,14 +11,18 @@ load_dotenv()
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-3-12b-it:free")
 CURRENT_YEAR = "2025"
+APP_MEMORY_LIMIT_MB = int(os.getenv("APP_MEMORY_LIMIT_MB", "900"))
+
+logger = logging.getLogger("trumpbot.ai")
 
 # ✅ 检测内存，超过限制自动退出
 
-def check_memory_and_exit(limit_mb=900):
+def check_memory_and_exit(limit_mb: int = APP_MEMORY_LIMIT_MB) -> None:
     mem = psutil.Process(os.getpid()).memory_info().rss / 1024 / 1024
     if mem > limit_mb:
-        print(f"⚠️ 内存超限：{mem:.2f} MB，准备退出")
+        logger.error("Memory limit exceeded: %.2f MB > %s MB. Exiting process.", mem, limit_mb)
         os._exit(0)
+    logger.debug("Memory usage check passed: %.2f MB (limit %s MB).", mem, limit_mb)
 
 # ✅ 清洗输出，防止 markdown 裂开 + 修处时间
 
@@ -94,25 +100,29 @@ async def ask_ai(topic="", system="", user=""):
     }
 
     try:
-        async with httpx.AsyncClient() as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             res = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data)
             res_data = res.json()
 
             if "error" in res_data:
                 if res_data["error"].get("code") == 429:
+                    logger.warning("OpenRouter rate limited the request.")
                     return "🚫 太多人在用 TrumpBot！请等等再试～（模型限流）"
-                return f"❌ 模型错误：{res_data['error'].get('message', '未知错误')}"
+                message = res_data["error"].get("message", "未知错误")
+                logger.error("Model returned an error: %s", message)
+                return f"❌ 模型错误：{message}"
 
             content = extract_content(res_data)
             if not content or len(content) < 16:
+                logger.warning("Model returned empty or too-short content.")
                 return "⚠️ 模型没有返回有效内容，或输出太短，请稍后再试。"
 
             # 输出前检测内存
-            check_memory_and_exit()
+            check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
 
             return sanitize_discord_output(content)
 
-    except Exception as e:
-        print("❌ AI 请求失败:", e)
-        check_memory_and_exit()
+    except Exception as e:  # noqa: BLE001
+        logger.exception("AI request failed: %s", e)
+        check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
         return "⚠️ AI 请求失败，请稍后再试。"

@@ -1,0 +1,25 @@
+version: "3.9"
+
+services:
+  trumpbot:
+    build: .
+    restart: unless-stopped
+    dns:
+      - 8.8.8.8
+    env_file:
+      - .env
+    environment:
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+      APP_MEMORY_LIMIT_MB: ${APP_MEMORY_LIMIT_MB:-900}
+      TRUMPBOT_FETCH_RETRIES: ${TRUMPBOT_FETCH_RETRIES:-3}
+      TRUMPBOT_FETCH_RETRY_DELAY: ${TRUMPBOT_FETCH_RETRY_DELAY:-5}
+      TRUMPBOT_STARTUP_RETRIES: ${TRUMPBOT_STARTUP_RETRIES:-5}
+      TRUMPBOT_STARTUP_RETRY_DELAY: ${TRUMPBOT_STARTUP_RETRY_DELAY:-10}
+    mem_limit: 1g
+    mem_reservation: 768m
+    healthcheck:
+      test: ["CMD", "python", "/app/healthcheck.py"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 30s

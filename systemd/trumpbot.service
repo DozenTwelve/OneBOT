@@ -1,0 +1,17 @@
+[Unit]
+Description=TrumpBot Discord bot (docker-compose)
+Requires=docker.service network-online.target
+After=docker.service network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/Yzr/Projects/OneBOT
+ExecStart=/usr/bin/docker compose --project-name trumpbot up
+ExecStop=/usr/bin/docker compose --project-name trumpbot down
+Restart=always
+RestartSec=10
+TimeoutStartSec=60
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target
