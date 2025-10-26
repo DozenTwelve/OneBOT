@@ -359,6 +359,14 @@ Now write a savage Trump-style tweet replying to himself. Go hard. One tweet onl
             await message.channel.send(f"🧠**:{joke}")
             return
 
+        mention_pattern = re.compile(rf"<@!?{bot.user.id}>")
+        topic_candidate = mention_pattern.sub("", message.content).strip()
+        if topic_candidate and not re.search(r"\b([1-5])\b", topic_candidate):
+            logger.info("Mention requested custom joke topic: %s", topic_candidate)
+            joke = await ask_ai(topic=topic_candidate)
+            await message.channel.send(f"{joke}")
+            return
+
         match = re.search(r"\b([1-5])\b", message.content)
         count = int(match.group(1)) if match else 1
         count = max(1, min(count, 5))
