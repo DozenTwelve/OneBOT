@@ -29,6 +29,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "You ONLY write short, sarcastic, bold, and funny Truth Social-style tweets. "
     "Use ALL CAPS, emojis, and phrases like 'SAD!', 'FAKE NEWS!', 'DISASTER!'. "
     "Respond with ONLY ONE tweet. Do NOT explain, do NOT clarify, and absolutely NO disclaimers. "
+    "Do NOT output internal reasoning, analysis, or anything inside <think> tags—only the final tweet. "
     "Just the tweet. Nothing else. Your tweet MUST end with a period ('.') and contain no follow-up explanation. "
     "If you are not allowed to respond due to content moderation, respond IN CHARACTER as Trump yelling at the user for being TOO SENSITIVE or for CENSORSHIP."
     "Maximum 280 characters."
@@ -36,8 +37,8 @@ DEFAULT_SYSTEM_PROMPT = (
 
 SMOKE_TEST_USER_PROMPT = os.getenv(
     "OPENROUTER_SMOKE_TEST_PROMPT",
-    "Give me a short, overconfident Trump-style tweet about winning BIGLY.",
-).strip() or "Give me a short, overconfident Trump-style tweet about winning BIGLY."
+    "Write a savage Trump-style joke about Xi Jinping that pulls no punches.",
+).strip() or "Write a savage Trump-style joke about Xi Jinping that pulls no punches."
 
 SMOKE_TEST_SYSTEM_PROMPT = (
     os.getenv("OPENROUTER_SMOKE_TEST_SYSTEM", DEFAULT_SYSTEM_PROMPT).strip()
@@ -55,6 +56,54 @@ except ValueError:
     SMOKE_TEST_DELAY_SECONDS = 0.5
 
 MODEL_REQUEST_TIMEOUT = float(os.getenv("OPENROUTER_REQUEST_TIMEOUT", "15"))
+
+_REFUSAL_MARKERS = [
+    "i'm sorry",
+    "i am sorry",
+    "sorry, i can't",
+    "sorry, i cannot",
+    "sorry but i can't",
+    "can't comply",
+    "cannot comply",
+    "can't assist",
+    "cannot assist",
+    "i can't help with",
+    "i cannot help with",
+    "i can't provide",
+    "i cannot provide",
+    "i can't fulfill",
+    "i cannot fulfill",
+    "against my policy",
+    "against our policy",
+    "against policy",
+    "due to policy",
+    "violates policy",
+    "policy guidelines",
+    "content policy",
+    "moderation guidelines",
+    "i must refuse",
+    "i have to refuse",
+    "cannot generate that",
+    "i cannot generate",
+    "not able to comply",
+    "decline to comply",
+    "sorry but i won't",
+    "i won't do that request",
+]
+
+_REASONING_MARKERS = [
+    "the user wants",
+    "the instruction says",
+    "the user is asking",
+    "let me think",
+    "let's think",
+    "analysis:",
+    "reasoning:",
+    "thought process",
+    "deliberation:",
+    "step by step reasoning",
+    "internal reasoning",
+]
 
 _current_model: str = ""
 _free_model_cache: List[Dict[str, object]] = []
@@ -174,6 +223,16 @@ async def _invoke_model(
         return {"success": False, "detail": "empty_content"}
 
     sanitized = sanitize_discord_output(content)
+    if _is_refusal_response(sanitized):
+        logger.warning("Model %s refused to comply with the request.", model_id)
+        check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
+        return {"success": False, "detail": "refusal", "code": "refusal"}
+
+    if _has_reasoning_leak(sanitized):
+        logger.warning("Model %s response leaked internal reasoning.", model_id)
+        check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
+        return {"success": False, "detail": "reasoning_leak"}
+
     check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
     return {
         "success": True,
@@ -440,6 +499,7 @@ def check_memory_and_exit(limit_mb: int = APP_MEMORY_LIMIT_MB) -> None:
 # ✅ 清洗输出，防止 markdown 裂开 + 修处时间
 
 def sanitize_discord_output(text: str) -> str:
+    text = re.sub(r"(?is)<\s*think[^>]*>.*?(?:</\s*think>|$)", "", text)
     text = text.replace("**", "** ").replace("__", "__ ").replace("*", "* ")
     text = text.strip()
 
@@ -466,6 +526,16 @@ def sanitize_discord_output(text: str) -> str:
     )
 
     return text.strip()
+
+
+def _is_refusal_response(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _REFUSAL_MARKERS)
+
+
+def _has_reasoning_leak(text: str) -> bool:
+    lowered = text.lower()
+    return any(marker in lowered for marker in _REASONING_MARKERS)
 
 # ✅ 提取模型返回内容（支持 GPT / Gemini 等）
 def extract_content(data):
@@ -523,6 +593,23 @@ async def ask_ai(topic="", system="", user=""):
             return fallback_result.get("content", "")
         logger.error("Fallback after rate limit failed: %s", fallback_result.get("detail"))
         return "🚫 太多人在用 TrumpBot！请等等再试～（模型限流）"
+
+    if detail in {"refusal", "reasoning_leak"}:
+        logger.warning("Model %s returned unusable content (%s); attempting fallback.", model_id, detail)
+        fallback_result = await _try_model_fallback(
+            system=system_prompt,
+            user=user_prompt,
+            temperature=0.9,
+            top_p=0.9,
+            max_tokens=256,
+            exclude={model_id},
+        )
+        if fallback_result.get("success"):
+            return fallback_result.get("content", "")
+        logger.error("Fallback after %s failed: %s", detail, fallback_result.get("detail"))
+        if detail == "refusal":
+            return "⚠️ 当前模型拒绝生成内容，请稍后再试。"
+        return "⚠️ 模型输出异常，请稍后再试。"
 
     if detail == "empty_content":
         logger.warning("Model %s returned empty or too-short content.", model_id)
