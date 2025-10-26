@@ -1,6 +1,7 @@
 import logging
 import os
 import re
+from typing import Dict, List, Optional
 
 import httpx
 import psutil
@@ -9,11 +10,176 @@ from dotenv import load_dotenv
 load_dotenv()
 
 OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
-MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-3-12b-it:free")
+DEFAULT_MODEL = os.getenv("OPENROUTER_MODEL", "google/gemma-3-12b-it:free")
+AUTO_SELECT_FREE_MODEL = os.getenv("OPENROUTER_AUTO_SELECT_FREE", "true").lower() in {
+    "1",
+    "true",
+    "yes",
+}
 CURRENT_YEAR = "2025"
-APP_MEMORY_LIMIT_MB = int(os.getenv("APP_MEMORY_LIMIT_MB", "900"))
+APP_MEMORY_LIMIT_MB = int(os.getenv("APP_MEMORY_LIMIT_MB", "1900"))
 
 logger = logging.getLogger("trumpbot.ai")
+
+SAFE_FALLBACK_MESSAGE = "🚫 当前没有可用的免费模型，请稍后再试。"
+
+_current_model: str = ""
+_free_model_cache: List[Dict[str, object]] = []
+
+
+def _has_free_keyword(model_id: Optional[str], model_name: Optional[str] = None) -> bool:
+    text = ((model_id or "") + " " + (model_name or "")).lower()
+    return "free" in text
+
+
+if DEFAULT_MODEL and _has_free_keyword(DEFAULT_MODEL):
+    _current_model = DEFAULT_MODEL
+else:
+    if DEFAULT_MODEL:
+        logger.warning(
+            "Configured default model %s does not contain 'free'; AI replies disabled until a free model is selected.",
+            DEFAULT_MODEL,
+        )
+    DEFAULT_MODEL = ""
+
+
+def get_current_model() -> str:
+    return _current_model
+
+
+def get_free_model_cache() -> List[Dict[str, object]]:
+    return [dict(entry) for entry in _free_model_cache]
+
+
+def _set_current_model(model_id: str, reason: str, model_name: Optional[str] = None) -> None:
+    global _current_model
+    model_id = model_id.strip()
+    if not model_id:
+        return
+    if not _has_free_keyword(model_id, model_name):
+        logger.warning(
+            "Attempt to switch to model %s rejected because it is not labeled as free.", model_id
+        )
+        return
+    if model_id == _current_model:
+        return
+    logger.info("Switching OpenRouter model from %s to %s (%s).", _current_model, model_id, reason)
+    _current_model = model_id
+
+# ✅ 刷新可用模型（按上下文窗口大小排序）
+
+async def refresh_free_models() -> List[Dict[str, str]]:
+    if not OPENROUTER_API_KEY:
+        logger.warning("OPENROUTER_API_KEY not configured; skipping free model refresh.")
+        return []
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "HTTP-Referer": "https://yourdomain.com",
+        "X-Title": "TrumpBot",
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+            res = await client.get("https://openrouter.ai/api/v1/models", headers=headers)
+            res.raise_for_status()
+            payload = res.json()
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("Failed to refresh OpenRouter model catalogue: %s", exc)
+        return []
+
+    candidates: List[Dict[str, object]] = []
+    for item in payload.get("data", []):
+        model_id = item.get("id")
+        if not model_id:
+            continue
+
+        pricing = item.get("pricing") or {}
+        prompt_cost = _to_float(pricing.get("prompt"))
+        completion_cost = _to_float(pricing.get("completion"))
+
+        model_name = item.get("name")
+        if prompt_cost != 0.0 or completion_cost != 0.0:
+            continue
+
+        if not _has_free_keyword(model_id, model_name):
+            continue
+
+        context_tokens = _extract_context_length(item)
+        candidates.append(
+            {
+                "id": model_id,
+                "name": model_name or model_id,
+                "context_tokens": context_tokens,
+            }
+        )
+
+    candidates.sort(key=lambda entry: (-int(entry["context_tokens"]), entry["id"]))
+
+    global _free_model_cache, _current_model
+    _free_model_cache = candidates
+
+    if AUTO_SELECT_FREE_MODEL and candidates:
+        top = candidates[0]
+        _set_current_model(top["id"], reason="auto-selected free model", model_name=top["name"])
+        logger.info(
+            "Auto-selected free model %s with context window %s tokens.",
+            top["id"],
+            top["context_tokens"],
+        )
+    elif not candidates:
+        logger.warning("No free OpenRouter models detected; disabling AI responses for safety.")
+        _current_model = ""
+
+    return get_free_model_cache()
+
+
+def _to_float(value) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float("nan")
+
+
+def _extract_context_length(item: Dict[str, object]) -> int:
+    keys_to_check = [
+        "context_length",
+        "context_window",
+        "max_context_tokens",
+        "input_max_tokens",
+        "max_input_tokens",
+        "max_output_tokens",
+        "tokens",
+    ]
+    nested_keys = [
+        ("limits", "context_length"),
+        ("limits", "max_context"),
+        ("limits", "max_input_tokens"),
+        ("usage", "max_tokens"),
+    ]
+
+    for key in keys_to_check:
+        value = item.get(key)
+        extracted = _coerce_int(value)
+        if extracted:
+            return extracted
+
+    for parent, child in nested_keys:
+        parent_obj = item.get(parent) or {}
+        extracted = _coerce_int(parent_obj.get(child))
+        if extracted:
+            return extracted
+
+    return 0
+
+
+def _coerce_int(value) -> int:
+    if isinstance(value, (int, float)):
+        return int(value)
+    if isinstance(value, str) and value.isdigit():
+        return int(value)
+    return 0
+
 
 # ✅ 检测内存，超过限制自动退出
 
@@ -66,6 +232,13 @@ def extract_content(data):
 
 # ✅ 主函数：生成 AI 回复
 async def ask_ai(topic="", system="", user=""):
+    model_id = get_current_model() or DEFAULT_MODEL
+    if not model_id or not _has_free_keyword(model_id):
+        logger.error(
+            "Attempted to send AI request without a verified free model. Aborting to protect balance."
+        )
+        return SAFE_FALLBACK_MESSAGE
+
     headers = {
         "Authorization": f"Bearer {OPENROUTER_API_KEY}",
         "Content-Type": "application/json",
@@ -89,7 +262,7 @@ async def ask_ai(topic="", system="", user=""):
         user = f"Write a Truth Social post about {topic}."
 
     data = {
-        "model": MODEL,
+        "model": model_id,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user}
@@ -98,6 +271,8 @@ async def ask_ai(topic="", system="", user=""):
         "top_p": 0.9,
         "max_tokens": 256
     }
+
+    logger.debug("Requesting OpenRouter completion via model %s.", model_id)
 
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:

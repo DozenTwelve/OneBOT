@@ -27,7 +27,9 @@
    OPENROUTER_API_KEY=your_openrouter_key
    # Optional overrides
    LOG_LEVEL=INFO
-   APP_MEMORY_LIMIT_MB=900
+   APP_MEMORY_LIMIT_MB=1900
+   OPENROUTER_AUTO_SELECT_FREE=true
+   OPENROUTER_FREE_MODEL_REFRESH_HOURS=168
    ```
 2. Build and run the bot with Docker Compose (creates a Chromium-enabled container and enforces resource limits):
    ```bash
@@ -52,11 +54,13 @@
 - Startup waits for Truth Social readiness before connecting to Discord and automatically retries transient failures.
 - Discord caching is trimmed (`max_messages=100`) and only the required intents (guilds, messages, message content) are enabled to reduce memory usage.
 - Background tasks periodically clear the cached message deque and publish resource usage metrics so you can observe memory trends in the logs.
+- Once a week (configurable), the bot queries OpenRouter for the currently-free models, sorts them by context window size, and switches to the best option automatically when `OPENROUTER_AUTO_SELECT_FREE` is enabled.
+- To protect your OpenRouter balance, only models whose ID or name contains the word “free” are ever selected; if none are available the AI features pause until a free model returns.
 - All prints were replaced with Python logging; configure verbosity via `LOG_LEVEL` (e.g., `DEBUG`, `INFO`, `WARNING`).
 
 ## 🧪 Operational Checks
 
-- The bot exits if RSS usage exceeds `APP_MEMORY_LIMIT_MB` (default 900 MB). Pair this with the Docker memory ceiling for predictable resource bound.
+- The bot exits if RSS usage exceeds `APP_MEMORY_LIMIT_MB` (default 1 900 MB). Pair this with the Docker memory ceiling for predictable resource bound.
 - Health and scrape retries are configurable via:
   - `TRUMPBOT_FETCH_RETRIES`, `TRUMPBOT_FETCH_RETRY_DELAY`
   - `TRUMPBOT_STARTUP_RETRIES`, `TRUMPBOT_STARTUP_RETRY_DELAY`

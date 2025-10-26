@@ -15,11 +15,12 @@ load_dotenv()
 
 TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-APP_MEMORY_LIMIT_MB = int(os.getenv("APP_MEMORY_LIMIT_MB", "900"))
+APP_MEMORY_LIMIT_MB = int(os.getenv("APP_MEMORY_LIMIT_MB", "1900"))
 POST_FETCH_RETRIES = max(1, int(os.getenv("TRUMPBOT_FETCH_RETRIES", "3")))
 POST_FETCH_RETRY_DELAY = max(1, int(os.getenv("TRUMPBOT_FETCH_RETRY_DELAY", "5")))
 STARTUP_RETRY_LIMIT = int(os.getenv("TRUMPBOT_STARTUP_RETRIES", "5"))
 STARTUP_RETRY_DELAY = max(1, int(os.getenv("TRUMPBOT_STARTUP_RETRY_DELAY", "10")))
+FREE_MODEL_REFRESH_HOURS = max(1, int(os.getenv("OPENROUTER_FREE_MODEL_REFRESH_HOURS", "168")))
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -28,7 +29,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger("trumpbot")
 
-from ai_helper import ask_ai, check_memory_and_exit  # noqa: E402
+from ai_helper import (  # noqa: E402
+    ask_ai,
+    check_memory_and_exit,
+    get_current_model,
+    refresh_free_models,
+)
 
 intents = discord.Intents.none()
 intents.guilds = True
@@ -90,6 +96,39 @@ async def report_resource_usage() -> None:
 
 @report_resource_usage.before_loop
 async def before_report_resource_usage() -> None:
+    await bot.wait_until_ready()
+
+
+async def _perform_model_refresh(reason: str) -> None:
+    models = await refresh_free_models()
+    if models:
+        top = models[0]
+        logger.info(
+            "Free model refresh (%s) candidate: %s (context %s tokens). Active model: %s",
+            reason,
+            top["id"],
+            top["context_tokens"],
+            get_current_model(),
+        )
+        preview = ", ".join(
+            f"{entry['id']}({entry['context_tokens']})" for entry in models[:5]
+        )
+        logger.debug("Top free models (%s): %s", reason, preview)
+    else:
+        logger.warning(
+            "Free model refresh (%s) found no available free models. Continuing with %s.",
+            reason,
+            get_current_model(),
+        )
+
+
+@tasks.loop(hours=FREE_MODEL_REFRESH_HOURS)
+async def refresh_free_models_task() -> None:
+    await _perform_model_refresh("scheduled")
+
+
+@refresh_free_models_task.before_loop
+async def before_refresh_free_models_task() -> None:
     await bot.wait_until_ready()
 
 
@@ -175,6 +214,8 @@ async def setup_hook():
         clear_message_cache.start()
     if not report_resource_usage.is_running():
         report_resource_usage.start()
+    if not refresh_free_models_task.is_running():
+        refresh_free_models_task.start()
     logger.debug("Background maintenance tasks have started.")
 
 
@@ -260,6 +301,8 @@ async def run_bot() -> None:
     if not TOKEN:
         logger.error("DISCORD_BOT_TOKEN is not configured. Exiting.")
         return
+
+    await _perform_model_refresh("startup")
 
     retry_count = 0
     while True:

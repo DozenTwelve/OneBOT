@@ -10,13 +10,15 @@ services:
       - .env
     environment:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      APP_MEMORY_LIMIT_MB: ${APP_MEMORY_LIMIT_MB:-900}
+      APP_MEMORY_LIMIT_MB: ${APP_MEMORY_LIMIT_MB:-1900}
       TRUMPBOT_FETCH_RETRIES: ${TRUMPBOT_FETCH_RETRIES:-3}
       TRUMPBOT_FETCH_RETRY_DELAY: ${TRUMPBOT_FETCH_RETRY_DELAY:-5}
       TRUMPBOT_STARTUP_RETRIES: ${TRUMPBOT_STARTUP_RETRIES:-5}
       TRUMPBOT_STARTUP_RETRY_DELAY: ${TRUMPBOT_STARTUP_RETRY_DELAY:-10}
-    mem_limit: 1g
-    mem_reservation: 768m
+      OPENROUTER_AUTO_SELECT_FREE: ${OPENROUTER_AUTO_SELECT_FREE:-true}
+      OPENROUTER_FREE_MODEL_REFRESH_HOURS: ${OPENROUTER_FREE_MODEL_REFRESH_HOURS:-168}
+    mem_limit: 2g
+    mem_reservation: 1536m
     healthcheck:
       test: ["CMD", "python", "/app/healthcheck.py"]
       interval: 60s
