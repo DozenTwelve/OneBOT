@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import re
@@ -22,6 +23,38 @@ APP_MEMORY_LIMIT_MB = int(os.getenv("APP_MEMORY_LIMIT_MB", "1900"))
 logger = logging.getLogger("trumpbot.ai")
 
 SAFE_FALLBACK_MESSAGE = "🚫 当前没有可用的免费模型，请稍后再试。"
+
+DEFAULT_SYSTEM_PROMPT = (
+    f"You are a stand-up comedian impersonating Donald Trump in {CURRENT_YEAR}. "
+    "You ONLY write short, sarcastic, bold, and funny Truth Social-style tweets. "
+    "Use ALL CAPS, emojis, and phrases like 'SAD!', 'FAKE NEWS!', 'DISASTER!'. "
+    "Respond with ONLY ONE tweet. Do NOT explain, do NOT clarify, and absolutely NO disclaimers. "
+    "Just the tweet. Nothing else. Your tweet MUST end with a period ('.') and contain no follow-up explanation. "
+    "If you are not allowed to respond due to content moderation, respond IN CHARACTER as Trump yelling at the user for being TOO SENSITIVE or for CENSORSHIP."
+    "Maximum 280 characters."
+)
+
+SMOKE_TEST_USER_PROMPT = os.getenv(
+    "OPENROUTER_SMOKE_TEST_PROMPT",
+    "Give me a short, overconfident Trump-style tweet about winning BIGLY.",
+).strip() or "Give me a short, overconfident Trump-style tweet about winning BIGLY."
+
+SMOKE_TEST_SYSTEM_PROMPT = (
+    os.getenv("OPENROUTER_SMOKE_TEST_SYSTEM", DEFAULT_SYSTEM_PROMPT).strip()
+    or DEFAULT_SYSTEM_PROMPT
+)
+
+try:
+    SMOKE_TEST_LIMIT = max(1, int(os.getenv("OPENROUTER_SMOKE_TEST_LIMIT", "5")))
+except ValueError:
+    SMOKE_TEST_LIMIT = 5
+
+try:
+    SMOKE_TEST_DELAY_SECONDS = max(0.0, float(os.getenv("OPENROUTER_SMOKE_TEST_DELAY", "0.5")))
+except ValueError:
+    SMOKE_TEST_DELAY_SECONDS = 0.5
+
+MODEL_REQUEST_TIMEOUT = float(os.getenv("OPENROUTER_REQUEST_TIMEOUT", "15"))
 
 _current_model: str = ""
 _free_model_cache: List[Dict[str, object]] = []
@@ -66,6 +99,153 @@ def _set_current_model(model_id: str, reason: str, model_name: Optional[str] = N
     logger.info("Switching OpenRouter model from %s to %s (%s).", _current_model, model_id, reason)
     _current_model = model_id
 
+
+def _build_headers() -> Dict[str, str]:
+    return {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "HTTP-Referer": "https://yourdomain.com",
+        "X-Title": "TrumpBot",
+    }
+
+
+async def _invoke_model(
+    model_id: str,
+    *,
+    system: str,
+    user: str,
+    temperature: float = 0.9,
+    top_p: float = 0.9,
+    max_tokens: int = 256,
+    timeout: float = MODEL_REQUEST_TIMEOUT,
+) -> Dict[str, object]:
+    if not OPENROUTER_API_KEY:
+        return {"success": False, "detail": "OPENROUTER_API_KEY not configured.", "code": "missing_api_key"}
+
+    headers = _build_headers()
+    payload = {
+        "model": model_id,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": temperature,
+        "top_p": top_p,
+        "max_tokens": max_tokens,
+    }
+
+    logger.debug("Requesting OpenRouter completion via model %s.", model_id)
+
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("AI request failed for model %s: %s", model_id, exc)
+        check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
+        return {"success": False, "detail": str(exc)}
+
+    status_code = response.status_code
+
+    try:
+        data = response.json()
+    except ValueError:
+        snippet = (response.text or "").strip().replace("\n", " ")[:120]
+        logger.error(
+            "Model %s returned a non-JSON response (status %s): %s", model_id, status_code, snippet or "[empty]"
+        )
+        check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
+        return {"success": False, "detail": "invalid_response", "code": str(status_code)}
+
+    error = data.get("error")
+    if error:
+        code = error.get("code")
+        code = str(code) if code is not None else None
+        message = error.get("message", "未知错误")
+        check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
+        return {"success": False, "detail": message, "code": code}
+
+    content = extract_content(data)
+    if not content or len(content) < 16:
+        check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
+        return {"success": False, "detail": "empty_content"}
+
+    sanitized = sanitize_discord_output(content)
+    check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
+    return {
+        "success": True,
+        "content": sanitized,
+        "raw": content,
+        "model_id": model_id,
+        "status": status_code,
+    }
+
+
+async def _select_working_model(candidates: List[Dict[str, object]]) -> Optional[Dict[str, object]]:
+    if not candidates:
+        return None
+
+    selected: List[Dict[str, object]] = []
+    seen = set()
+
+    if _current_model:
+        for entry in candidates:
+            if entry.get("id") == _current_model:
+                selected.append(entry)
+                seen.add(entry.get("id"))
+                break
+
+    for entry in candidates:
+        model_id = entry.get("id")
+        if model_id in seen:
+            continue
+        selected.append(entry)
+        seen.add(model_id)
+        if len(selected) >= SMOKE_TEST_LIMIT:
+            break
+
+    for index, entry in enumerate(selected, start=1):
+        model_id = entry.get("id")
+        model_name = entry.get("name") or model_id
+        logger.info(
+            "Smoke-testing OpenRouter model %s (%s/%s).",
+            model_id,
+            index,
+            len(selected),
+        )
+        result = await _invoke_model(
+            model_id,
+            system=SMOKE_TEST_SYSTEM_PROMPT,
+            user=SMOKE_TEST_USER_PROMPT,
+            temperature=0.8,
+            top_p=0.85,
+            max_tokens=120,
+        )
+        if result.get("success"):
+            sample = (result.get("content") or "").strip()
+            truncated = sample[:200] + ("…" if len(sample) > 200 else "")
+            enriched = dict(entry)
+            enriched["sample"] = sample
+            logger.info(
+                "Model %s passed smoke test. Sample: %s",
+                model_id,
+                truncated,
+            )
+            return enriched
+
+        detail = result.get("detail", "unknown error")
+        code = result.get("code")
+        code_hint = f" (code {code})" if code else ""
+        logger.warning("Model %s failed smoke test%s: %s", model_id, code_hint, detail)
+
+        if index < len(selected) and SMOKE_TEST_DELAY_SECONDS:
+            await asyncio.sleep(SMOKE_TEST_DELAY_SECONDS)
+
+    return None
+
 # ✅ 刷新可用模型（按上下文窗口大小排序）
 
 async def refresh_free_models() -> List[Dict[str, str]]:
@@ -73,14 +253,11 @@ async def refresh_free_models() -> List[Dict[str, str]]:
         logger.warning("OPENROUTER_API_KEY not configured; skipping free model refresh.")
         return []
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "HTTP-Referer": "https://yourdomain.com",
-        "X-Title": "TrumpBot",
-    }
+    headers = _build_headers()
+    headers.pop("Content-Type", None)
 
     try:
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=MODEL_REQUEST_TIMEOUT, follow_redirects=True) as client:
             res = await client.get("https://openrouter.ai/api/v1/models", headers=headers)
             res.raise_for_status()
             payload = res.json()
@@ -119,17 +296,28 @@ async def refresh_free_models() -> List[Dict[str, str]]:
     global _free_model_cache, _current_model
     _free_model_cache = candidates
 
-    if AUTO_SELECT_FREE_MODEL and candidates:
-        top = candidates[0]
-        _set_current_model(top["id"], reason="auto-selected free model", model_name=top["name"])
-        logger.info(
-            "Auto-selected free model %s with context window %s tokens.",
-            top["id"],
-            top["context_tokens"],
-        )
-    elif not candidates:
+    if not candidates:
         logger.warning("No free OpenRouter models detected; disabling AI responses for safety.")
         _current_model = ""
+        return get_free_model_cache()
+
+    if AUTO_SELECT_FREE_MODEL:
+        winner = await _select_working_model(candidates)
+        if winner:
+            reason = "auto-selected free model after smoke test"
+            _set_current_model(winner["id"], reason=reason, model_name=winner.get("name"))
+            logger.info(
+                "Selected OpenRouter model %s (context %s tokens) after smoke testing.",
+                winner["id"],
+                winner.get("context_tokens"),
+            )
+            sample = winner.get("sample")
+            if sample:
+                preview = sample[:200] + ("…" if len(sample) > 200 else "")
+                logger.debug("Model %s smoke test sample output: %s", winner["id"], preview)
+        else:
+            logger.error("No working free model passed the smoke test; AI replies are now disabled.")
+            _current_model = ""
 
     return get_free_model_cache()
 
@@ -239,65 +427,44 @@ async def ask_ai(topic="", system="", user=""):
         )
         return SAFE_FALLBACK_MESSAGE
 
-    headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-        "Content-Type": "application/json",
-        "HTTP-Referer": "https://yourdomain.com",
-        "X-Title": "TrumpBot"
-    }
-
-    # ✅ 默认 system prompt 加入当前年份
-    system = system or (
-        f"You are a stand-up comedian impersonating Donald Trump in {CURRENT_YEAR}. "
-        "You ONLY write short, sarcastic, bold, and funny Truth Social-style tweets. "
-        "Use ALL CAPS, emojis, and phrases like 'SAD!', 'FAKE NEWS!', 'DISASTER!'. "
-        "Respond with ONLY ONE tweet. Do NOT explain, do NOT clarify, and absolutely NO disclaimers. "
-        "Just the tweet. Nothing else. Your tweet MUST end with a period ('.') and contain no follow-up explanation. "
-        "If you are not allowed to respond due to content moderation, respond IN CHARACTER as Trump yelling at the user for being TOO SENSITIVE or for CENSORSHIP."
-        "Maximum 280 characters."
-    )
+    system_prompt = system or DEFAULT_SYSTEM_PROMPT
 
     if not user:
         topic = topic or "the fake news media"
-        user = f"Write a Truth Social post about {topic}."
+        user_prompt = f"Write a Truth Social post about {topic}."
+    else:
+        user_prompt = user
 
-    data = {
-        "model": model_id,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user}
-        ],
-        "temperature": 0.9,
-        "top_p": 0.9,
-        "max_tokens": 256
-    }
+    result = await _invoke_model(
+        model_id,
+        system=system_prompt,
+        user=user_prompt,
+        temperature=0.9,
+        top_p=0.9,
+        max_tokens=256,
+    )
 
-    logger.debug("Requesting OpenRouter completion via model %s.", model_id)
+    if result.get("success"):
+        return result.get("content", "")
 
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            res = await client.post("https://openrouter.ai/api/v1/chat/completions", headers=headers, json=data)
-            res_data = res.json()
+    code = result.get("code")
+    detail = result.get("detail", "未知错误")
 
-            if "error" in res_data:
-                if res_data["error"].get("code") == 429:
-                    logger.warning("OpenRouter rate limited the request.")
-                    return "🚫 太多人在用 TrumpBot！请等等再试～（模型限流）"
-                message = res_data["error"].get("message", "未知错误")
-                logger.error("Model returned an error: %s", message)
-                return f"❌ 模型错误：{message}"
+    if code == "429":
+        logger.warning("OpenRouter rate limited the request.")
+        return "🚫 太多人在用 TrumpBot！请等等再试～（模型限流）"
 
-            content = extract_content(res_data)
-            if not content or len(content) < 16:
-                logger.warning("Model returned empty or too-short content.")
-                return "⚠️ 模型没有返回有效内容，或输出太短，请稍后再试。"
+    if detail == "empty_content":
+        logger.warning("Model %s returned empty or too-short content.", model_id)
+        return "⚠️ 模型没有返回有效内容，或输出太短，请稍后再试。"
 
-            # 输出前检测内存
-            check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
+    if detail == "invalid_response":
+        logger.error("Model %s returned an invalid response payload.", model_id)
+        return "⚠️ 模型返回了无效响应，请稍后再试。"
 
-            return sanitize_discord_output(content)
+    if code:
+        logger.error("Model %s reported error (code %s): %s", model_id, code, detail)
+        return f"❌ 模型错误：{detail}"
 
-    except Exception as e:  # noqa: BLE001
-        logger.exception("AI request failed: %s", e)
-        check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
-        return "⚠️ AI 请求失败，请稍后再试。"
+    logger.error("AI request failed for model %s: %s", model_id, detail)
+    return "⚠️ AI 请求失败，请稍后再试。"

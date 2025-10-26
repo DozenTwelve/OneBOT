@@ -70,8 +70,25 @@ async def ensure_dependencies_ready(max_attempts: int = 5, base_delay: int = 5) 
 async def clear_message_cache() -> None:
     """Periodically clear the cached message deque to reduce memory pressure."""
     removed = len(bot.cached_messages)
-    bot.cached_messages.clear()
-    logger.debug("Cleared cached Discord messages (removed %s).", removed)
+    cleared = False
+
+    connection = getattr(bot, "_connection", None)
+    message_cache = getattr(connection, "_messages", None) if connection else None
+
+    if hasattr(message_cache, "clear"):
+        message_cache.clear()
+        cleared = True
+
+    if cleared:
+        logger.debug("Cleared cached Discord messages (removed %s).", removed)
+    elif removed:
+        logger.warning(
+            "Unable to clear Discord cached messages; cache type %s is immutable. Size remains %s.",
+            type(bot.cached_messages).__name__,
+            removed,
+        )
+    else:
+        logger.debug("No cached Discord messages to clear.")
 
 
 @clear_message_cache.before_loop
