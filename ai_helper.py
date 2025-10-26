@@ -2,7 +2,7 @@ import asyncio
 import logging
 import os
 import re
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 
 import httpx
 import psutil
@@ -246,6 +246,65 @@ async def _select_working_model(candidates: List[Dict[str, object]]) -> Optional
 
     return None
 
+
+async def _try_model_fallback(
+    *,
+    system: str,
+    user: str,
+    temperature: float,
+    top_p: float,
+    max_tokens: int,
+    exclude: Optional[Set[str]] = None,
+) -> Dict[str, object]:
+    exclude_ids = set(exclude or set())
+
+    candidates = get_free_model_cache()
+    fallback_candidates = [entry for entry in candidates if entry.get("id") not in exclude_ids]
+
+    if not fallback_candidates:
+        candidates = await refresh_free_models()
+        fallback_candidates = [entry for entry in candidates if entry.get("id") not in exclude_ids]
+
+    if not fallback_candidates:
+        return {"success": False, "detail": "no_fallback_models"}
+
+    attempts = 0
+    last_failure: Optional[Dict[str, object]] = None
+
+    for entry in fallback_candidates:
+        attempts += 1
+        if SMOKE_TEST_LIMIT and attempts > SMOKE_TEST_LIMIT:
+            break
+
+        model_id = entry.get("id")
+        model_name = entry.get("name") or model_id
+        logger.info("Attempting fallback OpenRouter model %s after rate limit.", model_id)
+        result = await _invoke_model(
+            model_id,
+            system=system,
+            user=user,
+            temperature=temperature,
+            top_p=top_p,
+            max_tokens=max_tokens,
+        )
+        if result.get("success"):
+            _set_current_model(model_id, reason="fallback after rate limit", model_name=model_name)
+            sample = (result.get("content") or "").strip()
+            preview = sample[:200] + ("…" if len(sample) > 200 else "")
+            logger.info("Switched to fallback free model %s after rate limit. Sample: %s", model_id, preview)
+            return result
+
+        detail = result.get("detail", "unknown error")
+        code = result.get("code")
+        code_hint = f" (code {code})" if code else ""
+        logger.warning("Fallback model %s failed%s: %s", model_id, code_hint, detail)
+        last_failure = result
+
+        if SMOKE_TEST_DELAY_SECONDS:
+            await asyncio.sleep(SMOKE_TEST_DELAY_SECONDS)
+
+    return last_failure or {"success": False, "detail": "rate_limit_no_fallback"}
+
 # ✅ 刷新可用模型（按上下文窗口大小排序）
 
 async def refresh_free_models() -> List[Dict[str, str]]:
@@ -451,7 +510,18 @@ async def ask_ai(topic="", system="", user=""):
     detail = result.get("detail", "未知错误")
 
     if code == "429":
-        logger.warning("OpenRouter rate limited the request.")
+        logger.warning("OpenRouter model %s hit rate limit; attempting fallback.", model_id)
+        fallback_result = await _try_model_fallback(
+            system=system_prompt,
+            user=user_prompt,
+            temperature=0.9,
+            top_p=0.9,
+            max_tokens=256,
+            exclude={model_id},
+        )
+        if fallback_result.get("success"):
+            return fallback_result.get("content", "")
+        logger.error("Fallback after rate limit failed: %s", fallback_result.get("detail"))
         return "🚫 太多人在用 TrumpBot！请等等再试～（模型限流）"
 
     if detail == "empty_content":

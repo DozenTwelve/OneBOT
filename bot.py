@@ -2,14 +2,14 @@ import asyncio
 import logging
 import os
 import re
-from typing import List
+from typing import List, Optional
 
 import discord
 import httpx
 import psutil
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from playwright.async_api import Browser, Playwright, TimeoutError, async_playwright
 
 load_dotenv()
 
@@ -41,6 +41,59 @@ intents.guilds = True
 intents.messages = True
 intents.message_content = True
 bot = commands.Bot(command_prefix="/", intents=intents, max_messages=100)
+
+_playwright: Optional[Playwright] = None
+_browser: Optional[Browser] = None
+_browser_lock: Optional[asyncio.Lock] = None
+
+
+async def _ensure_browser() -> Browser:
+    global _playwright, _browser, _browser_lock
+
+    if _browser_lock is None:
+        _browser_lock = asyncio.Lock()
+
+    async with _browser_lock:
+        if _browser and _browser.is_connected():
+            return _browser
+
+        if _browser and not _browser.is_connected():
+            try:
+                await _browser.close()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to close disconnected Playwright browser.")
+            _browser = None
+
+        if _playwright is None:
+            _playwright = await async_playwright().start()
+
+        _browser = await _playwright.chromium.launch(
+            headless=True,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        return _browser
+
+
+async def _shutdown_playwright() -> None:
+    global _playwright, _browser, _browser_lock
+
+    lock = _browser_lock or asyncio.Lock()
+    async with lock:
+        if _browser:
+            try:
+                await _browser.close()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to close Playwright browser during shutdown.")
+            _browser = None
+
+        if _playwright:
+            try:
+                await _playwright.stop()
+            except Exception:  # noqa: BLE001
+                logger.exception("Failed to stop Playwright during shutdown.")
+            _playwright = None
+
+    _browser_lock = None
 
 
 async def ensure_dependencies_ready(max_attempts: int = 5, base_delay: int = 5) -> None:
@@ -153,62 +206,66 @@ async def get_trump_posts(count: int = 1) -> List[str]:
     """Fetch recent Truth Social posts authored by Donald Trump."""
     count = max(1, min(count, 5))
     for attempt in range(1, POST_FETCH_RETRIES + 1):
+        context = None
         try:
-            async with async_playwright() as playwright:
-                browser = await playwright.chromium.launch(
-                    headless=True,
-                    args=["--disable-blink-features=AutomationControlled"],
+            browser = await _ensure_browser()
+            context = await browser.new_context(
+                user_agent=(
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
                 )
-                context = await browser.new_context(
-                    user_agent=(
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-                    )
-                )
-                page = await context.new_page()
+            )
+            page = await context.new_page()
 
-                logger.info("Fetching %s Trump posts from Truth Social.", count)
-                await page.goto(
-                    "https://truthsocial.com/@realDonaldTrump",
-                    wait_until="domcontentloaded",
-                )
-                await page.wait_for_timeout(5000)
+            logger.info("Fetching %s Trump posts from Truth Social.", count)
+            await page.goto(
+                "https://truthsocial.com/@realDonaldTrump",
+                wait_until="domcontentloaded",
+            )
+            try:
+                await page.wait_for_selector("div.status__content-wrapper", timeout=12000)
+            except TimeoutError:
+                logger.warning("Timed out waiting for Truth Social content; proceeding with loaded data.")
 
-                posts: List[str] = []
-                max_scrolls = 25
-                scroll_count = 0
+            posts: List[str] = []
+            max_scrolls = 25
+            scroll_count = 0
 
-                while len(posts) < count and scroll_count < max_scrolls:
-                    post_elements = await page.locator("div.status__content-wrapper").all()
-                    logger.debug("Located %s post elements on the page.", len(post_elements))
-                    for post in post_elements:
-                        if len(posts) >= count:
-                            break
-                        text_elements = await post.locator("p.text-base").all()
-                        post_text = "\n".join([await t.inner_text() for t in text_elements])
-                        clean_text = re.sub(r"http\S+", "", post_text).strip()
-                        if clean_text and clean_text not in posts:
-                            posts.append(clean_text)
-                    if len(posts) < count:
-                        await page.evaluate("window.scrollBy(0, 500)")
-                        await asyncio.sleep(2)
-                        scroll_count += 1
+            while len(posts) < count and scroll_count < max_scrolls:
+                post_elements = await page.locator("div.status__content-wrapper").all()
+                logger.debug("Located %s post elements on the page.", len(post_elements))
+                for post in post_elements:
+                    if len(posts) >= count:
+                        break
+                    text_elements = await post.locator("p.text-base").all()
+                    post_text = "\n".join([await t.inner_text() for t in text_elements])
+                    clean_text = re.sub(r"http\S+", "", post_text).strip()
+                    if clean_text and clean_text not in posts:
+                        posts.append(clean_text)
+                if len(posts) < count:
+                    await page.evaluate("window.scrollBy(0, 500)")
+                    await asyncio.sleep(1)
+                    scroll_count += 1
 
-                await browser.close()
+            if not posts:
+                logger.error("Unable to find any posts—site may be slow or layout changed.")
+                return ["❌ 未找到帖子！可能是网站加载过慢，请重试！"]
 
-                if not posts:
-                    logger.error("Unable to find any posts—site may be slow or layout changed.")
-                    return ["❌ 未找到帖子！可能是网站加载过慢，请重试！"]
-
-                logger.info("Successfully fetched %s posts from Truth Social.", len(posts))
-                check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
-                return posts
+            logger.info("Successfully fetched %s posts from Truth Social.", len(posts))
+            check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
+            return posts
         except Exception:  # noqa: BLE001
             wait_time = POST_FETCH_RETRY_DELAY * attempt
             logger.exception("Attempt %s to fetch Trump posts failed.", attempt)
             if attempt == POST_FETCH_RETRIES:
                 return ["❌ 未找到帖子！可能是网站加载过慢，请重试！"]
             await asyncio.sleep(wait_time)
+        finally:
+            if context:
+                try:
+                    await context.close()
+                except Exception:  # noqa: BLE001
+                    logger.exception("Failed to close Playwright context after fetching posts.")
     return ["❌ 未找到帖子！可能是网站加载过慢，请重试！"]
 
 
@@ -274,23 +331,22 @@ async def on_message(message):
         logger.info("Mention received with content: %s", message.content)
 
         if "help" in content_lower:
-            help_prompt = """
-As Donald Trump, write a short and funny help message for a Discord bot.
-Describe the available commands in an overconfident, sarcastic tone.
-Use caps, exaggeration, emojis, and act like you're the greatest president AND bot creator.
-Commands:
-- /trump [1~5]: Get the latest Trump posts
-- /trumpjoke [topic]: Generate a Trump-style tweet joke
-- @Bot joke: Ask the bot to tell a joke
-- @Bot 3: Get 3 latest posts
-- @Bot help: Show this amazing help
-"""
-            help_text = await ask_ai(user=help_prompt)
+            help_text = (
+                "🇺🇸 TRUMP BOT — The GREATEST bot in Discord history! 🇺🇸\n"
+                "Nobody’s ever seen a bot like this before. People are saying it’s tremendous. "
+                "Some even call it the stable genius of bots. Believe me! 😎\n\n"
+                "Here’s what this beautiful, high-IQ bot can do:\n\n"
+                "🔥 /trump [1~5] — Get the latest incredible Trump posts. Only the best ones. Everyone’s talking about them.\n"
+                "😂 /trumpjoke [topic] — I make tremendous jokes, folks. The best jokes. Way better than Sleepy Joe’s.\n"
+                "🤣 @Bot joke — You want a joke? You’ll get the classiest, most luxurious joke ever told. Maybe about CNN. Maybe about windmills. Who knows!\n"
+                "🧱 @Bot 3 — I give you 3 posts. Because I’m generous. Nobody gives more posts than me.\n"
+                "📜 @Bot help — Shows this beautiful help message again. Probably the best help message ever written."
+            )
             await message.channel.send(f"📢 **TrumpBot Help**:\n{help_text}")
             return
 
         if "joke" in content_lower:
-            posts = await get_trump_posts(5)
+            posts = await get_trump_posts(1)
             chosen = select_valid_post(posts)
             logger.debug("@Bot joke selected post: %s", chosen)
             joke = await ask_ai(
@@ -322,33 +378,35 @@ async def run_bot() -> None:
     await _perform_model_refresh("startup")
 
     retry_count = 0
-    while True:
-        try:
-            await ensure_dependencies_ready()
-            await bot.start(TOKEN, reconnect=True)
-            break
-        except discord.LoginFailure:
-            logger.exception("Discord login failed due to invalid token. Exiting without retry.")
-            return
-        except (discord.HTTPException, discord.GatewayNotFound, OSError, httpx.HTTPError) as exc:
-            retry_count += 1
-            if STARTUP_RETRY_LIMIT and retry_count >= STARTUP_RETRY_LIMIT:
-                logger.exception("Bot failed to start after %s attempts. Exiting.", retry_count)
+    try:
+        while True:
+            try:
+                await ensure_dependencies_ready()
+                await bot.start(TOKEN, reconnect=True)
+                break
+            except discord.LoginFailure:
+                logger.exception("Discord login failed due to invalid token. Exiting without retry.")
                 return
-            wait_time = STARTUP_RETRY_DELAY * retry_count
-            logger.warning(
-                "Bot startup attempt %s failed: %s. Retrying in %s seconds.",
-                retry_count,
-                exc,
-                wait_time,
-            )
-            await asyncio.sleep(wait_time)
-        except Exception:  # noqa: BLE001
-            logger.exception("Unexpected error during bot startup.")
-            return
-
-    if not bot.is_closed():
-        await bot.close()
+            except (discord.HTTPException, discord.GatewayNotFound, OSError, httpx.HTTPError) as exc:
+                retry_count += 1
+                if STARTUP_RETRY_LIMIT and retry_count >= STARTUP_RETRY_LIMIT:
+                    logger.exception("Bot failed to start after %s attempts. Exiting.", retry_count)
+                    return
+                wait_time = STARTUP_RETRY_DELAY * retry_count
+                logger.warning(
+                    "Bot startup attempt %s failed: %s. Retrying in %s seconds.",
+                    retry_count,
+                    exc,
+                    wait_time,
+                )
+                await asyncio.sleep(wait_time)
+            except Exception:  # noqa: BLE001
+                logger.exception("Unexpected error during bot startup.")
+                return
+    finally:
+        if not bot.is_closed():
+            await bot.close()
+        await _shutdown_playwright()
 
 
 if __name__ == "__main__":
