@@ -21,6 +21,9 @@ POST_FETCH_RETRY_DELAY = max(1, int(os.getenv("TRUMPBOT_FETCH_RETRY_DELAY", "5")
 STARTUP_RETRY_LIMIT = int(os.getenv("TRUMPBOT_STARTUP_RETRIES", "5"))
 STARTUP_RETRY_DELAY = max(1, int(os.getenv("TRUMPBOT_STARTUP_RETRY_DELAY", "10")))
 FREE_MODEL_REFRESH_HOURS = max(1, int(os.getenv("OPENROUTER_FREE_MODEL_REFRESH_HOURS", "168")))
+EMPTY_AI_RESPONSE = "⚠️ 模型没有返回有效内容，请稍后再试。"
+MAX_SCROLLS = max(1, int(os.getenv("TRUMPBOT_MAX_SCROLLS", "25")))
+SCROLL_STALL_LIMIT = max(1, int(os.getenv("TRUMPBOT_SCROLL_STALL_LIMIT", "5")))
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -35,6 +38,11 @@ from ai_helper import (  # noqa: E402
     get_current_model,
     refresh_free_models,
 )
+
+
+def _preview_text(text: str, limit: int = 120) -> str:
+    text = text or ""
+    return text if len(text) <= limit else text[:limit] + "…"
 
 intents = discord.Intents.none()
 intents.guilds = True
@@ -228,12 +236,13 @@ async def get_trump_posts(count: int = 1) -> List[str]:
                 logger.warning("Timed out waiting for Truth Social content; proceeding with loaded data.")
 
             posts: List[str] = []
-            max_scrolls = 25
             scroll_count = 0
+            stalled_scrolls = 0
 
-            while len(posts) < count and scroll_count < max_scrolls:
+            while len(posts) < count and scroll_count < MAX_SCROLLS:
                 post_elements = await page.locator("div.status__content-wrapper").all()
                 logger.debug("Located %s post elements on the page.", len(post_elements))
+                before_len = len(posts)
                 for post in post_elements:
                     if len(posts) >= count:
                         break
@@ -246,10 +255,29 @@ async def get_trump_posts(count: int = 1) -> List[str]:
                     await page.evaluate("window.scrollBy(0, 500)")
                     await asyncio.sleep(1)
                     scroll_count += 1
+                    if len(posts) == before_len:
+                        stalled_scrolls += 1
+                        if stalled_scrolls >= SCROLL_STALL_LIMIT:
+                            logger.debug(
+                                "Stopping Truth Social scroll after %s stall cycles with no new posts.",
+                                stalled_scrolls,
+                            )
+                            break
+                    else:
+                        stalled_scrolls = 0
 
             if not posts:
                 logger.error("Unable to find any posts—site may be slow or layout changed.")
                 return ["❌ 未找到帖子！可能是网站加载过慢，请重试！"]
+
+            if len(posts) < count:
+                logger.info(
+                    "Only %s posts available after %s scrolls (requested %s, max scrolls %s).",
+                    len(posts),
+                    scroll_count,
+                    count,
+                    MAX_SCROLLS,
+                )
 
             logger.info("Successfully fetched %s posts from Truth Social.", len(posts))
             check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
@@ -318,6 +346,11 @@ async def trumpjoke(ctx, *, topic: str = ""):
 
 Write a funnier, bolder Trump-style reply to his own post. Be sarcastic, confident, and hilarious. One tweet only.'''
         )
+    if not joke or not joke.strip():
+        logger.error("AI returned empty response for /trumpjoke (topic=%s).", topic or "[latest post]")
+        await ctx.send(EMPTY_AI_RESPONSE)
+        return
+    logger.debug("/trumpjoke response preview: %s", _preview_text(joke))
     await ctx.send(f"{joke}")
 
 
@@ -356,7 +389,12 @@ async def on_message(message):
 
 Now write a savage Trump-style tweet replying to himself. Go hard. One tweet only.'''
             )
-            await message.channel.send(f"🧠**:{joke}")
+            if not joke or not joke.strip():
+                logger.error("AI returned empty response for mention joke request.")
+                await message.channel.send(EMPTY_AI_RESPONSE)
+                return
+            logger.debug("Mention joke response preview: %s", _preview_text(joke))
+            await message.channel.send(f"🧠 {joke}")
             return
 
         mention_pattern = re.compile(rf"<@!?{bot.user.id}>")
@@ -364,6 +402,15 @@ Now write a savage Trump-style tweet replying to himself. Go hard. One tweet onl
         if topic_candidate and not re.search(r"\b([1-5])\b", topic_candidate):
             logger.info("Mention requested custom joke topic: %s", topic_candidate)
             joke = await ask_ai(topic=topic_candidate)
+            if not joke or not joke.strip():
+                logger.error("AI returned empty response for mention topic '%s'.", topic_candidate)
+                await message.channel.send(EMPTY_AI_RESPONSE)
+                return
+            logger.debug(
+                "Mention custom topic response preview (%s): %s",
+                topic_candidate,
+                _preview_text(joke),
+            )
             await message.channel.send(f"{joke}")
             return
 

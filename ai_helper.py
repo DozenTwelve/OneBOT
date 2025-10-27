@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import re
+import time
 from typing import Dict, List, Optional, Set
 
 import httpx
@@ -19,6 +20,7 @@ AUTO_SELECT_FREE_MODEL = os.getenv("OPENROUTER_AUTO_SELECT_FREE", "true").lower(
 }
 CURRENT_YEAR = "2025"
 APP_MEMORY_LIMIT_MB = int(os.getenv("APP_MEMORY_LIMIT_MB", "1900"))
+MIN_REFRESH_INTERVAL = max(0.0, float(os.getenv("OPENROUTER_REFRESH_MIN_SECONDS", "60")))
 
 logger = logging.getLogger("trumpbot.ai")
 
@@ -44,6 +46,18 @@ SMOKE_TEST_SYSTEM_PROMPT = (
     os.getenv("OPENROUTER_SMOKE_TEST_SYSTEM", DEFAULT_SYSTEM_PROMPT).strip()
     or DEFAULT_SYSTEM_PROMPT
 )
+
+TRANSIENT_ERROR_CODES = {
+    "429",
+    "500",
+    "502",
+    "503",
+    "504",
+    "522",
+    "524",
+    "timeout",
+    "network_error",
+}
 
 try:
     SMOKE_TEST_LIMIT = max(1, int(os.getenv("OPENROUTER_SMOKE_TEST_LIMIT", "5")))
@@ -107,6 +121,7 @@ _REASONING_MARKERS = [
 
 _current_model: str = ""
 _free_model_cache: List[Dict[str, object]] = []
+_last_refresh_ts: float = 0.0
 
 
 def _has_free_keyword(model_id: Optional[str], model_name: Optional[str] = None) -> bool:
@@ -195,7 +210,7 @@ async def _invoke_model(
     except Exception as exc:  # noqa: BLE001
         logger.exception("AI request failed for model %s: %s", model_id, exc)
         check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
-        return {"success": False, "detail": str(exc)}
+        return {"success": False, "detail": str(exc), "code": "network_error"}
 
     status_code = response.status_code
 
@@ -207,7 +222,12 @@ async def _invoke_model(
             "Model %s returned a non-JSON response (status %s): %s", model_id, status_code, snippet or "[empty]"
         )
         check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
-        return {"success": False, "detail": "invalid_response", "code": str(status_code)}
+        return {
+            "success": False,
+            "detail": "invalid_response",
+            "code": str(status_code),
+            "status": status_code,
+        }
 
     error = data.get("error")
     if error:
@@ -215,23 +235,27 @@ async def _invoke_model(
         code = str(code) if code is not None else None
         message = error.get("message", "未知错误")
         check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
-        return {"success": False, "detail": message, "code": code}
+        return {"success": False, "detail": message, "code": code, "status": status_code}
 
     content = extract_content(data)
     if not content or len(content) < 16:
         check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
-        return {"success": False, "detail": "empty_content"}
+        return {"success": False, "detail": "empty_content", "status": status_code}
 
     sanitized = sanitize_discord_output(content)
+    if not sanitized.strip():
+        logger.warning("Model %s response sanitized to empty content.", model_id)
+        check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
+        return {"success": False, "detail": "empty_content", "status": status_code}
     if _is_refusal_response(sanitized):
         logger.warning("Model %s refused to comply with the request.", model_id)
         check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
-        return {"success": False, "detail": "refusal", "code": "refusal"}
+        return {"success": False, "detail": "refusal", "code": "refusal", "status": status_code}
 
     if _has_reasoning_leak(sanitized):
         logger.warning("Model %s response leaked internal reasoning.", model_id)
         check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
-        return {"success": False, "detail": "reasoning_leak"}
+        return {"success": False, "detail": "reasoning_leak", "status": status_code}
 
     check_memory_and_exit(limit_mb=APP_MEMORY_LIMIT_MB)
     return {
@@ -367,9 +391,23 @@ async def _try_model_fallback(
 # ✅ 刷新可用模型（按上下文窗口大小排序）
 
 async def refresh_free_models() -> List[Dict[str, str]]:
+    global _free_model_cache, _current_model, _last_refresh_ts
+
     if not OPENROUTER_API_KEY:
         logger.warning("OPENROUTER_API_KEY not configured; skipping free model refresh.")
         return []
+
+    now = time.monotonic()
+    if (
+        MIN_REFRESH_INTERVAL
+        and _free_model_cache
+        and now - _last_refresh_ts < MIN_REFRESH_INTERVAL
+    ):
+        logger.debug(
+            "Skipping OpenRouter model refresh; last refresh %.2f seconds ago.",
+            now - _last_refresh_ts,
+        )
+        return get_free_model_cache()
 
     headers = _build_headers()
     headers.pop("Content-Type", None)
@@ -381,6 +419,7 @@ async def refresh_free_models() -> List[Dict[str, str]]:
             payload = res.json()
     except Exception as exc:  # noqa: BLE001
         logger.exception("Failed to refresh OpenRouter model catalogue: %s", exc)
+        _last_refresh_ts = now
         return []
 
     candidates: List[Dict[str, object]] = []
@@ -411,8 +450,8 @@ async def refresh_free_models() -> List[Dict[str, str]]:
 
     candidates.sort(key=lambda entry: (-int(entry["context_tokens"]), entry["id"]))
 
-    global _free_model_cache, _current_model
     _free_model_cache = candidates
+    _last_refresh_ts = now
 
     if not candidates:
         logger.warning("No free OpenRouter models detected; disabling AI responses for safety.")
@@ -578,6 +617,8 @@ async def ask_ai(topic="", system="", user=""):
 
     code = result.get("code")
     detail = result.get("detail", "未知错误")
+    status_code = result.get("status")
+    lowered_detail = (detail or "").lower()
 
     if code == "429":
         logger.warning("OpenRouter model %s hit rate limit; attempting fallback.", model_id)
@@ -610,6 +651,44 @@ async def ask_ai(topic="", system="", user=""):
         if detail == "refusal":
             return "⚠️ 当前模型拒绝生成内容，请稍后再试。"
         return "⚠️ 模型输出异常，请稍后再试。"
+
+    should_try_fallback = False
+
+    if code:
+        if code.lower() in TRANSIENT_ERROR_CODES:
+            should_try_fallback = True
+        elif code.isdigit() and int(code) >= 500:
+            should_try_fallback = True
+    if status_code and status_code >= 500:
+        should_try_fallback = True
+    if "timeout" in lowered_detail or "temporarily unavailable" in lowered_detail:
+        should_try_fallback = True
+    if detail in {"invalid_response", "empty_content"}:
+        should_try_fallback = True
+
+    if should_try_fallback:
+        logger.warning(
+            "Model %s transient failure (code=%s, status=%s, detail=%s); attempting fallback.",
+            model_id,
+            code,
+            status_code,
+            detail,
+        )
+        fallback_result = await _try_model_fallback(
+            system=system_prompt,
+            user=user_prompt,
+            temperature=0.9,
+            top_p=0.9,
+            max_tokens=256,
+            exclude={model_id},
+        )
+        if fallback_result.get("success"):
+            return fallback_result.get("content", "")
+        logger.error(
+            "Fallback after transient failure (code=%s) failed: %s",
+            code,
+            fallback_result.get("detail"),
+        )
 
     if detail == "empty_content":
         logger.warning("Model %s returned empty or too-short content.", model_id)
